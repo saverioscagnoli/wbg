@@ -1,0 +1,10 @@
+[package]
+name = "wbg"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+smithay-client-toolkit = "*"
+image = { version = "*", default-features = false, features = ["png", "jpeg"] }
+lexopt = "0.3.2"
+traccia = "4.1.2"
