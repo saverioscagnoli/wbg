@@ -8,3 +8,6 @@ smithay-client-toolkit = "*"
 image = { version = "*", default-features = false, features = ["png", "jpeg"] }
 lexopt = "0.3.2"
 traccia = "4.1.2"
+
+[profile.dev.package."*"]
+opt-level = 3
