@@ -40,6 +40,13 @@ pub fn request(msg: &str) -> std::io::Result<String> {
     Ok(resp)
 }
 
+pub fn reply(r: Result<(), image::ImageError>) -> String {
+    match r {
+        Ok(()) => "ok\n".to_string(),
+        Err(e) => format!("error: {}\n", e),
+    }
+}
+
 pub fn handle_client(app: &mut App, mut stream: UnixStream) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
     let mut req = String::new();
@@ -48,13 +55,16 @@ pub fn handle_client(app: &mut App, mut stream: UnixStream) {
         return;
     };
 
-    let resp = match req.split_once(' ') {
-        None if req == "get" => format!("{}\n", app.path.display()),
-        Some(("set", p)) => match app.set_wallpaper(PathBuf::from(p)) {
-            Ok(()) => "ok\n".to_string(),
-            Err(e) => format!("error: {}\n", e),
-        },
+    let parts: Vec<&str> = req.split('\n').collect();
 
+    let resp = match parts.as_slice() {
+        ["get"] => app.describe(),
+        ["set", path] => reply(app.set_default(PathBuf::from(path))),
+        ["set-output", name, path] => reply(app.set_output(name.to_string(), PathBuf::from(path))),
+        ["unset-output", name] => {
+            app.unset_output(name);
+            "ok\n".to_string()
+        }
         _ => "error: bad request\n".to_string(),
     };
 

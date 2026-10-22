@@ -3,7 +3,11 @@ use std::path::PathBuf;
 pub enum Command {
     Start(PathBuf),
     Get,
-    Set(PathBuf),
+    Set {
+        output: Option<String>,
+        path: PathBuf,
+    },
+    Unset(String),
 }
 
 impl Command {
@@ -19,10 +23,26 @@ impl Command {
 
         let command = match cmd.as_str() {
             "get" => Command::Get,
-            "set" => match parser.next()? {
-                Some(Value(v)) => Command::Set(v.string()?.into()),
+            "set" => {
+                let mut output = None;
+                let mut path = None;
+
+                while let Some(arg) = parser.next()? {
+                    match arg {
+                        Short('o') | Long("output") => output = Some(parser.value()?.string()?),
+                        Value(v) if path.is_none() => path = Some(PathBuf::from(v)),
+                        _ => return Err(arg.unexpected()),
+                    }
+                }
+
+                let path = path.ok_or("missing path")?;
+
+                Command::Set { output, path }
+            }
+            "unset" => match parser.next()? {
+                Some(Value(v)) => Command::Unset(v.string()?),
                 Some(arg) => return Err(arg.unexpected()),
-                None => return Err("missing command".into()),
+                None => return Err("missing output name".into()),
             },
             other => Command::Start(other.into()),
         };
@@ -36,7 +56,8 @@ impl Command {
 
     pub fn print_usage() {
         println!("usage: wbg <path>");
-        println!("       wbg set <path>");
+        println!("       wbg set [-o <output>] <path>");
+        println!("       wbg unset <output>");
         println!("       wbg get");
     }
 }

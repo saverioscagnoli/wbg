@@ -1,9 +1,11 @@
 mod args;
 mod ipc;
 
+use std::collections::HashMap;
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use image::DynamicImage;
 
@@ -42,14 +44,36 @@ use traccia::LevelFilter;
 use traccia::debug;
 use traccia::error;
 use traccia::info;
+use traccia::warn;
 
 use crate::args::Command;
 
 struct Wallpaper {
     output: wl_output::WlOutput,
+    name: Option<String>,
     layer: LayerSurface,
     size: Option<(u32, u32)>,
     scale: i32,
+}
+
+struct Source {
+    path: PathBuf,
+    image: Rc<DynamicImage>,
+}
+
+impl Source {
+    fn open(path: PathBuf) -> Result<Source, image::ImageError> {
+        let image = Rc::new(image::open(&path)?);
+        Ok(Source { path, image })
+    }
+
+    fn r#for<'a>(
+        default: &'a Source,
+        overrides: &'a HashMap<String, Source>,
+        name: Option<&str>,
+    ) -> &'a Self {
+        name.and_then(|n| overrides.get(n)).unwrap_or(default)
+    }
 }
 
 fn draw(pool: &mut SlotPool, img: &DynamicImage, layer: &LayerSurface, w: u32, h: u32, scale: i32) {
@@ -84,24 +108,70 @@ struct App {
     layer_shell: LayerShell,
     shm: Shm,
     pool: SlotPool,
-    image: DynamicImage,
-    path: PathBuf,
+    default: Source,
+    overrides: HashMap<String, Source>,
     wallpapers: Vec<Wallpaper>,
 }
 
 impl App {
-    pub fn set_wallpaper(&mut self, path: PathBuf) -> Result<(), image::ImageError> {
-        self.image = image::open(&path)?;
-        self.path = path;
-        info!("using path: '{}'", self.path.display());
-
+    fn redraw(&mut self, output: Option<&str>) {
         for wp in &self.wallpapers {
-            if let Some((w, h)) = wp.size {
-                draw(&mut self.pool, &self.image, &wp.layer, w, h, wp.scale);
+            let name = wp.name.as_deref();
+
+            match output {
+                Some(target) if name != Some(target) => continue,
+                None if name.is_some_and(|n| self.overrides.contains_key(n)) => continue,
+                _ => {}
             }
+
+            let Some((w, h)) = wp.size else { continue };
+            let src = Source::r#for(&self.default, &self.overrides, name);
+            draw(&mut self.pool, &src.image, &wp.layer, w, h, wp.scale);
+        }
+    }
+
+    pub fn set_default(&mut self, path: PathBuf) -> Result<(), image::ImageError> {
+        self.default = Source::open(path)?;
+        info!("default: '{}'", self.default.path.display());
+        self.redraw(None);
+        Ok(())
+    }
+
+    pub fn set_output(&mut self, name: String, path: PathBuf) -> Result<(), image::ImageError> {
+        let src = Source::open(path)?;
+        info!("{}: {}", name, src.path.display());
+
+        if !self
+            .wallpapers
+            .iter()
+            .any(|wp| wp.name.as_deref() == Some(&name))
+        {
+            warn!("output '{}' is not connected, keeping it for later", name);
         }
 
+        self.overrides.insert(name.clone(), src);
+        self.redraw(Some(&name));
         Ok(())
+    }
+
+    pub fn unset_output(&mut self, name: &str) {
+        if self.overrides.remove(name).is_some() {
+            self.redraw(Some(name));
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        use std::fmt::Write;
+
+        let mut out = format!("* {}\n", self.default.path.display());
+
+        for wp in &self.wallpapers {
+            let name = wp.name.as_deref().unwrap_or("?");
+            let src = Source::r#for(&self.default, &self.overrides, wp.name.as_deref());
+            let _ = writeln!(out, "{} {}", name, src.path.display());
+        }
+
+        out
     }
 }
 
@@ -111,6 +181,9 @@ impl OutputHandler for App {
     }
 
     fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        let name = self.output_state.info(&output).and_then(|i| i.name);
+        info!("new output: {}", name.as_deref().unwrap_or("<unnamed>"));
+
         let surface = self.compositor.create_surface(qh);
         let layer = self.layer_shell.create_layer_surface(
             qh,
@@ -128,6 +201,7 @@ impl OutputHandler for App {
 
         self.wallpapers.push(Wallpaper {
             output,
+            name,
             layer,
             scale: 1,
             size: None,
@@ -166,17 +240,18 @@ impl LayerShellHandler for App {
             return;
         }
 
-        let mut scale = 1;
-
-        if let Some(wp) = self
+        let Some(wp) = self
             .wallpapers
             .iter_mut()
             .find(|wp| wp.layer.wl_surface() == layer.wl_surface())
-        {
-            wp.size = Some((w, h));
-            scale = wp.scale;
-        }
-        draw(&mut self.pool, &self.image, layer, w, h, scale);
+        else {
+            return;
+        };
+
+        wp.size = Some((w, h));
+        let src = Source::r#for(&self.default, &self.overrides, wp.name.as_deref());
+
+        draw(&mut self.pool, &src.image, layer, w, h, wp.scale);
     }
 }
 
@@ -196,7 +271,8 @@ impl CompositorHandler for App {
             wp.scale = factor;
 
             if let Some((w, h)) = wp.size {
-                draw(&mut self.pool, &self.image, &wp.layer, w, h, factor);
+                let src = Source::r#for(&self.default, &self.overrides, wp.name.as_deref());
+                draw(&mut self.pool, &src.image, &wp.layer, w, h, factor);
             }
         }
     }
@@ -209,7 +285,9 @@ impl CompositorHandler for App {
         _: wl_output::Transform,
     ) {
     }
+
     fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
+
     fn surface_enter(
         &mut self,
         _: &Connection,
@@ -218,6 +296,7 @@ impl CompositorHandler for App {
         _: &wl_output::WlOutput,
     ) {
     }
+
     fn surface_leave(
         &mut self,
         _: &Connection,
@@ -238,6 +317,7 @@ impl ProvidesRegistryState for App {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
     }
+
     registry_handlers![OutputState];
 }
 
@@ -247,8 +327,8 @@ smithay_client_toolkit::delegate_dispatch2!(App);
 fn start_daemon(path: PathBuf) {
     info!("using path '{}'", path.display());
 
-    let image = match image::open(&path) {
-        Ok(img) => img,
+    let default = match Source::open(path) {
+        Ok(s) => s,
         Err(e) => {
             error!("failed to open image: {}", e);
             return;
@@ -312,8 +392,8 @@ fn start_daemon(path: PathBuf) {
         layer_shell,
         shm,
         pool,
-        image,
-        path,
+        default,
+        overrides: HashMap::new(),
         wallpapers: Vec::new(),
     };
 
@@ -392,7 +472,7 @@ fn main() {
                 std::process::exit(2);
             }
         },
-        Command::Set(path) => {
+        Command::Set { output, path } => {
             let path = match std::fs::canonicalize(&path) {
                 Ok(p) => p,
                 Err(e) => {
@@ -401,7 +481,12 @@ fn main() {
                 }
             };
 
-            match ipc::request(&format!("set {}", path.display())) {
+            let msg = match output {
+                Some(o) => format!("set-output\n{}\n{}", o, path.display()),
+                None => format!("set\n{}", path.display()),
+            };
+
+            match ipc::request(&msg) {
                 Ok(resp) if resp.starts_with("error") => {
                     error!("{}", resp);
                     std::process::exit(1);
@@ -413,5 +498,12 @@ fn main() {
                 }
             }
         }
+        Command::Unset(name) => match ipc::request(&format!("unset-output\n{}", name)) {
+            Ok(resp) => debug!("{}", resp),
+            Err(_) => {
+                error!("wbg is not running");
+                std::process::exit(2);
+            }
+        },
     }
 }
