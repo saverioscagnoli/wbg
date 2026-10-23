@@ -1,14 +1,14 @@
 mod args;
 mod ipc;
+mod log;
 
 use std::collections::HashMap;
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::path::PathBuf;
-use std::rc::Rc;
 
-use image::DynamicImage;
-
+use image::ImageReader;
 use image::imageops::FilterType;
 use smithay_client_toolkit::compositor::CompositorHandler;
 use smithay_client_toolkit::compositor::CompositorState;
@@ -40,7 +40,6 @@ use smithay_client_toolkit::shm::Shm;
 use smithay_client_toolkit::shm::ShmHandler;
 use smithay_client_toolkit::shm::slot::SlotPool;
 
-use traccia::LevelFilter;
 use traccia::debug;
 use traccia::error;
 use traccia::info;
@@ -58,13 +57,14 @@ struct Wallpaper {
 
 struct Source {
     path: PathBuf,
-    image: Rc<DynamicImage>,
 }
 
 impl Source {
     fn open(path: PathBuf) -> Result<Source, image::ImageError> {
-        let image = Rc::new(image::open(&path)?);
-        Ok(Source { path, image })
+        ImageReader::open(&path)?
+            .with_guessed_format()?
+            .into_dimensions()?;
+        Ok(Source { path })
     }
 
     fn r#for<'a>(
@@ -76,13 +76,21 @@ impl Source {
     }
 }
 
-fn draw(pool: &mut SlotPool, img: &DynamicImage, layer: &LayerSurface, w: u32, h: u32, scale: i32) {
-    // Physical pixel size of the output.
+fn draw(
+    pool: &mut SlotPool,
+    path: &Path,
+    layer: &LayerSurface,
+    w: u32,
+    h: u32,
+    scale: i32,
+) -> Result<(), image::ImageError> {
     let pw = w * scale as u32;
     let ph = h * scale as u32;
 
-    // Cover-scale and crop with a proper filter.
-    let scaled = img.resize_to_fill(pw, ph, FilterType::Lanczos3).to_rgb8();
+    let img = image::open(path)?;
+    let scaled = img.resize_to_fill(pw, ph, FilterType::Lanczos3).into_rgb8();
+
+    drop(img);
 
     let stride = pw as i32 * 4;
     let (buffer, canvas) = pool
@@ -99,6 +107,15 @@ fn draw(pool: &mut SlotPool, img: &DynamicImage, layer: &LayerSurface, w: u32, h
     surface.damage_buffer(0, 0, pw as i32, ph as i32);
     buffer.attach_to(surface).expect("attach");
     layer.commit();
+
+    drop(scaled);
+
+    #[cfg(target_env = "gnu")]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+
+    Ok(())
 }
 
 struct App {
@@ -126,7 +143,10 @@ impl App {
 
             let Some((w, h)) = wp.size else { continue };
             let src = Source::r#for(&self.default, &self.overrides, name);
-            draw(&mut self.pool, &src.image, &wp.layer, w, h, wp.scale);
+
+            if let Err(e) = draw(&mut self.pool, &src.path, &wp.layer, w, h, wp.scale) {
+                error!("failed to draw '{}': {}", src.path.display(), e);
+            }
         }
     }
 
@@ -251,7 +271,9 @@ impl LayerShellHandler for App {
         wp.size = Some((w, h));
         let src = Source::r#for(&self.default, &self.overrides, wp.name.as_deref());
 
-        draw(&mut self.pool, &src.image, layer, w, h, wp.scale);
+        if let Err(e) = draw(&mut self.pool, &src.path, layer, w, h, wp.scale) {
+            error!("failed to draw '{}': {}", src.path.display(), e);
+        }
     }
 }
 
@@ -272,7 +294,9 @@ impl CompositorHandler for App {
 
             if let Some((w, h)) = wp.size {
                 let src = Source::r#for(&self.default, &self.overrides, wp.name.as_deref());
-                draw(&mut self.pool, &src.image, &wp.layer, w, h, factor);
+                if let Err(e) = draw(&mut self.pool, &src.path, &wp.layer, w, h, factor) {
+                    error!("failed to draw '{}': {}", src.path.display(), e);
+                }
             }
         }
     }
@@ -438,13 +462,7 @@ fn start_daemon(path: PathBuf) {
 }
 
 fn main() {
-    let _ = traccia::init(
-        traccia::Config::default().with_min_level(if cfg!(debug_assertions) {
-            LevelFilter::Debug
-        } else {
-            LevelFilter::Info
-        }),
-    );
+    log::init();
 
     let command = match Command::parse() {
         Ok(cmd) => cmd,

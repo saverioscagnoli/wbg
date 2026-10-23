@@ -575,6 +575,7 @@ version = "0.1.0"
 dependencies = [
  "image",
  "lexopt",
+ "libc",
  "smithay-client-toolkit",
  "traccia",
 ]
