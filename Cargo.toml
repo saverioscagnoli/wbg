@@ -5,10 +5,11 @@ edition = "2024"
 
 [dependencies]
 smithay-client-toolkit = "*"
-image = { version = "*", default-features = false, features = ["png", "jpeg"] }
+image = { version = "*", default-features = false, features = ["png", "jpeg", "gif"] }
 lexopt = "0.3.2"
 traccia = "4.1.2"
 libc = "0.2.191"
+lz4_flex = "0.14.0"
 
 [profile.dev.package."*"]
 opt-level = 3
