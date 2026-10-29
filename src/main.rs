@@ -257,7 +257,7 @@ impl Source {
 }
 
 fn draw_image(
-    pool: &mut SlotPool,
+    shm: &Shm,
     path: &Path,
     wp: &Wallpaper,
     w: u32,
@@ -265,13 +265,15 @@ fn draw_image(
 ) -> Result<(), image::ImageError> {
     let pw = w * wp.scale as u32;
     let ph = h * wp.scale as u32;
+    let stride = pw as i32 * 4;
 
     let img = image::open(path)?;
     let scaled = img.resize_to_fill(pw, ph, FilterType::Lanczos3).into_rgb8();
-
     drop(img);
 
-    let stride = pw as i32 * 4;
+    let mut pool = SlotPool::new((stride * ph as i32) as usize, shm)
+        .map_err(|e| image::ImageError::IoError(std::io::Error::other(e)))?;
+
     let (buffer, canvas) = pool
         .create_buffer(pw as i32, ph as i32, stride, wl_shm::Format::Xrgb8888)
         .expect("create buffer");
@@ -292,11 +294,7 @@ fn draw_image(
     wp.layer.commit();
 
     drop(scaled);
-
-    #[cfg(target_env = "gnu")]
-    unsafe {
-        libc::malloc_trim(0);
-    }
+    util::trim();
 
     Ok(())
 }
@@ -315,11 +313,11 @@ fn fit_viewport(animation: &Animation, wp: &Wallpaper, w: u32, h: u32) {
     wp.viewport.set_destination(w as i32, h as i32);
 }
 
-fn draw(pool: &mut SlotPool, src: &Source, wp: &Wallpaper) -> Result<(), image::ImageError> {
+fn draw(shm: &Shm, src: &Source, wp: &Wallpaper) -> Result<(), image::ImageError> {
     let Some((w, h)) = wp.size else { return Ok(()) };
 
     match &src.animation {
-        None => draw_image(pool, &src.path, wp, w, h),
+        None => draw_image(shm, &src.path, wp, w, h),
         Some(animation) => {
             fit_viewport(animation, wp, w, h);
             Ok(())
@@ -365,7 +363,6 @@ struct App {
     compositor: CompositorState,
     layer_shell: LayerShell,
     shm: Shm,
-    pool: SlotPool,
     viewporter: WpViewporter,
     handle: LoopHandle<'static, Self>,
     default: Source,
@@ -454,7 +451,7 @@ impl App {
 
             let src = Source::r#for(&self.default, &self.overrides, name);
 
-            if let Err(e) = draw(&mut self.pool, src, wp) {
+            if let Err(e) = draw(&self.shm, src, wp) {
                 error!("failed to draw '{}': {}", src.path.display(), e);
             }
         }
@@ -473,6 +470,7 @@ impl App {
         self.animate(Target::Default);
 
         drop(old);
+        util::trim();
         Ok(())
     }
 
@@ -493,6 +491,7 @@ impl App {
         self.redraw(Some(&name));
         self.animate(Target::Output(name));
         drop(old);
+        util::trim();
         Ok(())
     }
 
@@ -500,6 +499,7 @@ impl App {
         if let Some(old) = self.overrides.remove(name) {
             self.redraw(Some(name));
             drop(old);
+            util::trim();
         }
     }
 
@@ -607,7 +607,7 @@ impl LayerShellHandler for App {
         wp.size = Some((w, h));
         let src = Source::r#for(&self.default, &self.overrides, wp.name.as_deref());
 
-        if let Err(e) = draw(&mut self.pool, src, wp) {
+        if let Err(e) = draw(&self.shm, src, wp) {
             error!("failed to draw '{}': {}", src.path.display(), e);
         }
 
@@ -634,7 +634,7 @@ impl CompositorHandler for App {
 
             let src = Source::r#for(&self.default, &self.overrides, wp.name.as_deref());
 
-            if let Err(e) = draw(&mut self.pool, src, wp) {
+            if let Err(e) = draw(&self.shm, src, wp) {
                 error!("failed to draw '{}': {}", src.path.display(), e);
             }
 
@@ -750,8 +750,6 @@ fn start_daemon(path: PathBuf) {
         }
     };
 
-    let pool = SlotPool::new(4096, &shm).unwrap();
-
     let viewporter = match globals.bind::<WpViewporter, App, NoEvents>(&qh, 1..=1, NoEvents) {
         Ok(v) => v,
         Err(e) => {
@@ -776,7 +774,6 @@ fn start_daemon(path: PathBuf) {
         compositor,
         layer_shell,
         shm,
-        pool,
         viewporter,
         handle: handle.clone(),
         default,

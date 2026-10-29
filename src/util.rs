@@ -37,3 +37,10 @@ pub fn encode(prev: &[u8], curr: &[u8]) -> (Vec<(u32, u32)>, Vec<u8>) {
 
     (spans, lz4_flex::compress(&data))
 }
+
+pub fn trim() {
+    #[cfg(target_env = "gnu")]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
